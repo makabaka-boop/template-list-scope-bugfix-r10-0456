@@ -101,7 +101,7 @@ export function parseTemplate(source, file) {
 
     if (trimmed === "else") {
       const frame = stack[stack.length - 1];
-      if (frame.node === root || frame.elseSeen) {
+      if (frame.node.type !== "if" || frame.elseSeen) {
         fail("unmatched {{else}}", {
           code: "INVALID_TEMPLATE_SYNTAX",
           file,
@@ -110,14 +110,16 @@ export function parseTemplate(source, file) {
       }
       frame.elseSeen = true;
     } else if (trimmed === "/if" || trimmed === "/each") {
-      const frame = stack.pop();
-      if (!frame || frame.node === root) {
-        fail("unmatched {{/if}}", {
+      const frame = stack[stack.length - 1];
+      const expected = trimmed === "/if" ? "if" : "each";
+      if (frame.node.type !== expected) {
+        fail(`unmatched {{${trimmed}}}`, {
           code: "INVALID_TEMPLATE_SYNTAX",
           file,
           position: loc,
         });
       }
+      stack.pop();
     } else if (trimmed.startsWith("#each ")) {
       const match = /^#each\s+(.+?)\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*)$/.exec(
         trimmed,
@@ -169,7 +171,7 @@ export function parseTemplate(source, file) {
 
   if (stack.length > 1) {
     const open = stack[stack.length - 1].node;
-    fail("unterminated {{#if}} block", {
+    fail(`unterminated {{#${open.type}}} block`, {
       code: "INVALID_TEMPLATE_SYNTAX",
       file,
       position: open.loc,

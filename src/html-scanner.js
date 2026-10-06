@@ -171,6 +171,10 @@ class HtmlScanner {
     this.state = cloneState(scanner.state);
   }
 
+  inText() {
+    return this.state.mode === MODE.DATA;
+  }
+
   merge(scanner) {
     const merged = mergeStates(this.state, scanner.state);
     if (!merged) {

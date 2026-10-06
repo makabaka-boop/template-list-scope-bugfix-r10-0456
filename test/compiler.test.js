@@ -462,3 +462,190 @@ test("parse5 checks URL payloads do not introduce attributes or elements", () =>
   assert.equal(a.attrs[0].name, "href");
   assert.match(a.attrs[0].value, /^\/path\?x=%22/);
 });
+
+test("each scopes aliases per iteration without leaking into root data", () => {
+  const compiled = compile({
+    "index.html":
+      "{{#each items as row}}[{{row.name}}|{{title}}]{{/each}}after:{{row.name}}",
+  });
+  const data = {
+    items: [{ name: "a" }, { name: "b" }],
+    row: { name: "ROOT" },
+    title: "T",
+  };
+  const snapshot = JSON.stringify(data);
+  assert.equal(compiled.render(data), "[a|T][b|T]after:ROOT");
+  assert.equal(JSON.stringify(data), snapshot, "render must not mutate data");
+});
+
+test("nested loops may reuse an alias; the inner loop shadows only its body", () => {
+  const compiled = compile({
+    "index.html":
+      "{{#each cats as row}}[{{row.name}}:{{#each row.items as row}}{{row.name}};{{/each}}={{row.name}}]{{/each}}",
+  });
+  assert.equal(
+    compiled.render({
+      cats: [
+        { name: "C1", items: [{ name: "i1" }, { name: "i2" }] },
+        { name: "C2", items: [{ name: "i3" }] },
+      ],
+    }),
+    "[C1:i1;i2;=C1][C2:i3;=C2]",
+  );
+});
+
+test("aliases may use special legal field names without touching root data", () => {
+  const compiled = compile({
+    "index.html": "{{#each items as __proto__}}[{{__proto__.label}}]{{/each}}",
+  });
+  const data = { items: [{ label: "x" }] };
+  assert.equal(compiled.render(data), "[x]");
+  assert.equal(Object.getPrototypeOf(data), Object.prototype);
+  assert.equal(data.polluted, undefined);
+});
+
+test("includes inside a loop read the current item of every iteration", () => {
+  const compiled = compile({
+    "index.html": '{{#each items as row}}{{#include "card.html"}};{{/each}}{{row.name}}',
+    "card.html": "[{{row.name}}]",
+  });
+  const data = { items: [{ name: "a" }, { name: "b" }], row: { name: "ROOT" } };
+  assert.equal(compiled.render(data), "[a];[b];ROOT");
+});
+
+test("each bodies are checked structurally at compile time, empty list or not", () => {
+  rejectCode(
+    () => compile({ "index.html": "<div {{#each items as row}}x{{/each}}>" }),
+    "EACH_OUTSIDE_TEXT_CONTEXT",
+  );
+  rejectCode(
+    () =>
+      compile({ "index.html": '<p title="{{#each items as row}}x{{/each}}">' }),
+    "EACH_OUTSIDE_TEXT_CONTEXT",
+  );
+  rejectCode(
+    () => compile({ "index.html": "{{#each items as row}}<b {{/each}}>" }),
+    "EACH_CONTEXT_MISMATCH",
+  );
+  rejectCode(
+    () =>
+      compile({
+        "index.html": '{{#each items as row}}<span title="{{row.x}}{{/each}}">',
+      }),
+    "EACH_CONTEXT_MISMATCH",
+  );
+  rejectCode(
+    () =>
+      compile({
+        "index.html": '{{#each items as row}}{{#include "p"}}{{/each}}',
+        p: "<div",
+      }),
+    "EACH_CONTEXT_MISMATCH",
+  );
+  // A balanced body compiles and renders an empty fragment for an empty list.
+  const compiled = compile({
+    "index.html": "<ul>{{#each items as row}}<li>{{row.name}}</li>{{/each}}</ul>",
+  });
+  assert.equal(compiled.render({ items: [] }), "<ul></ul>");
+  assert.equal(
+    compiled.render({ items: [{ name: "<x>" }] }),
+    "<ul><li>&lt;x&gt;</li></ul>",
+  );
+});
+
+test("each keeps text, attribute, and URL escaping contexts inside the body", () => {
+  const compiled = compile({
+    "index.html":
+      '{{#each items as row}}<p title="{{row.name}}">{{row.name}}</p><a href="{{row.url}}">go</a>{{/each}}',
+  });
+  const html = compiled.render({
+    items: [
+      { name: `<b>"q"</b>`, url: "/ok?a=1&b=2" },
+      { name: "plain", url: "https://example.com/x" },
+    ],
+  });
+  assert.equal(
+    html,
+    '<p title="&lt;b&gt;&quot;q&quot;&lt;/b&gt;">&lt;b&gt;"q"&lt;/b&gt;</p><a href="/ok?a=1&amp;b=2">go</a>' +
+      '<p title="plain">plain</p><a href="https://example.com/x">go</a>',
+  );
+});
+
+test("each validates the list itself before rendering", () => {
+  const compiled = compile({
+    "index.html": "{{#each items as row}}{{row.name}}{{/each}}",
+  });
+  rejectCode(() => compiled.render({}), "MISSING_VARIABLE");
+  rejectCode(() => compiled.render({ items: "abc" }), "VARIABLE_TYPE_ERROR");
+  rejectCode(() => compiled.render({ items: {} }), "VARIABLE_TYPE_ERROR");
+  rejectCode(
+    () => compiled.render({ items: [["not", "plain"]] }),
+    "VARIABLE_TYPE_ERROR",
+  );
+  rejectCode(
+    () => compiled.render({ items: [null] }),
+    "VARIABLE_TYPE_ERROR",
+  );
+  rejectCode(
+    () => compiled.render({ items: Array.from({ length: 33 }, () => ({})) }),
+    "EACH_LIMIT_EXCEEDED",
+  );
+  assert.equal(
+    compiled.render({ items: Array.from({ length: 32 }, () => ({ name: "n" })) }).length,
+    32,
+  );
+});
+
+test("an invalid item fails the whole render atomically with include diagnostics", () => {
+  const compiled = compile({
+    "index.html": '<header>{{title}}</header>{{#include "list.html"}}',
+    "list.html": '{{#each items as row}}<a href="{{row.url}}">{{row.name}}</a>{{/each}}',
+  });
+  let caught;
+  try {
+    compiled.render({
+      title: "shop",
+      items: [
+        { name: "ok", url: "/ok" },
+        { name: "bad", url: "javascript:alert(1)" },
+      ],
+    });
+    assert.fail("expected render failure");
+  } catch (error) {
+    caught = error;
+  }
+  assert.equal(caught.code, "INVALID_URL");
+  assert.equal(caught.file, "list.html");
+  assert.deepEqual(caught.includeChain, ["index.html", "list.html"]);
+  assert.equal(caught.eachLocation, "items[1]");
+  assert.match(caught.format(), /include chain: index\.html -> list\.html/);
+
+  // A missing variable in a later item also fails before any output.
+  rejectCode(
+    () =>
+      compiled.render({
+        title: "shop",
+        items: [{ name: "ok", url: "/ok" }, { url: "/no-name" }],
+      }),
+    "MISSING_VARIABLE",
+  );
+});
+
+test("parser rejects mismatched block closers and else outside if", () => {
+  rejectCode(
+    () => compile({ "index.html": "{{#if x}}y{{/each}}" }),
+    "INVALID_TEMPLATE_SYNTAX",
+  );
+  rejectCode(
+    () => compile({ "index.html": "{{#each items as row}}y{{/if}}" }),
+    "INVALID_TEMPLATE_SYNTAX",
+  );
+  rejectCode(
+    () => compile({ "index.html": "{{#each items as row}}a{{else}}b{{/each}}" }),
+    "INVALID_TEMPLATE_SYNTAX",
+  );
+  rejectCode(
+    () => compile({ "index.html": "{{#each items as row}}a" }),
+    "INVALID_TEMPLATE_SYNTAX",
+  );
+});

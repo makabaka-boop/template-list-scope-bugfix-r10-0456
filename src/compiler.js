@@ -4,6 +4,7 @@ import { createScanner } from "./html-scanner.js";
 
 const MAX_FILES = 6;
 const MAX_TOTAL_BYTES = 20 * 1024;
+const MAX_EACH_ITEMS = 32;
 const DEFAULT_BASE_URL = "http://localhost/";
 
 function byteLength(value) {
@@ -147,21 +148,42 @@ function compileNodes(nodes, scanner, graph, chain, program) {
         loc: node.loc,
       });
     } else if (node.type === "each") {
-      const body = [];
-      compileNodes(node.nodes, scanner, graph, chain, body);
-      program.push({
-        type: "each",
-        path: node.path,
-        alias: node.alias,
-        nodes: body,
-        loc: node.loc,
-      });
+      compileEach(node, scanner, graph, chain, program);
     } else if (node.type === "if") {
       compileIf(node, scanner, graph, chain, program);
     } else if (node.type === "include") {
       compileInclude(node, scanner, graph, chain, program);
     }
   }
+}
+
+function compileEach(node, scanner, graph, chain, program) {
+  if (!scanner.inText()) {
+    fail("each block must begin in HTML text content", {
+      code: "EACH_OUTSIDE_TEXT_CONTEXT",
+      file: node.loc.file,
+      position: node.loc,
+    });
+  }
+  // The body is reviewed once, independently of the runtime array: it must
+  // leave every iteration in the same text context where it began.
+  const bodyScanner = createScanner();
+  const body = [];
+  compileNodes(node.nodes, bodyScanner, graph, chain, body);
+  if (!bodyScanner.inText()) {
+    fail("each body must end in the same HTML text context where it began", {
+      code: "EACH_CONTEXT_MISMATCH",
+      file: node.loc.file,
+      position: node.loc,
+    });
+  }
+  program.push({
+    type: "each",
+    path: node.path,
+    alias: node.alias,
+    nodes: body,
+    loc: node.loc,
+  });
 }
 
 function compileIf(node, scanner, graph, chain, program) {
@@ -272,8 +294,9 @@ export function compileTemplates(files, entry, options = {}) {
     files: [...graph.includedFiles],
     baseUrl,
     render(data = {}) {
-      validateProgram(program, data, baseUrl);
-      return renderProgram(program, data, baseUrl);
+      const scope = createRootScope(data);
+      validateProgram(program, scope, baseUrl, [entry]);
+      return renderProgram(program, scope, baseUrl);
     },
   };
 }
@@ -294,15 +317,55 @@ function requireSafeUrl(value, baseUrl, loc) {
   }
 }
 
-function lookup(path, data, loc, allowMissing = false) {
-  let current = data;
-  for (const key of path) {
+// Render-time data is a scope chain: each loop iteration pushes a frame that
+// binds the alias in a null-prototype map, so aliases (including names like
+// "__proto__") shadow outer variables without ever mutating the caller's
+// root data.
+function createRootScope(data) {
+  return { parent: null, vars: null, root: data };
+}
+
+function childScope(scope, alias, value) {
+  const vars = Object.create(null);
+  vars[alias] = value;
+  return { parent: scope, vars, root: scope.root };
+}
+
+function lookup(path, scope, loc) {
+  const [head, ...rest] = path;
+  let current;
+  let found = false;
+  for (let frame = scope; frame; frame = frame.parent) {
+    if (frame.vars && Object.prototype.hasOwnProperty.call(frame.vars, head)) {
+      current = frame.vars[head];
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    const root = scope.root;
+    if (
+      root !== null &&
+      typeof root === "object" &&
+      Object.prototype.hasOwnProperty.call(root, head)
+    ) {
+      current = root[head];
+      found = true;
+    }
+  }
+  if (!found) {
+    fail(`missing variable ${path.join(".")}`, {
+      code: "MISSING_VARIABLE",
+      file: loc?.file,
+      position: loc,
+    });
+  }
+  for (const key of rest) {
     if (
       current === null ||
       typeof current !== "object" ||
       !Object.prototype.hasOwnProperty.call(current, key)
     ) {
-      if (allowMissing) return { missing: true };
       fail(`missing variable ${path.join(".")}`, {
         code: "MISSING_VARIABLE",
         file: loc?.file,
@@ -314,37 +377,108 @@ function lookup(path, data, loc, allowMissing = false) {
   return { value: current };
 }
 
-function validateProgram(nodes, data, baseUrl) {
+function isPlainObject(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value))
+    return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+function validateProgram(nodes, scope, baseUrl, chain) {
   for (const node of nodes) {
-    if (node.type === "literal" || node.type === "each") continue;
-    if (node.type === "output") {
-      const result = lookup(node.path, data, node.loc);
-      const value = result.value;
-      if (typeof value !== "string") {
-        fail(`variable ${node.path.join(".")} must be a string`, {
-          code: "VARIABLE_TYPE_ERROR",
-          file: node.loc?.file,
-          position: node.loc,
-        });
-      }
-      if (node.kind === "url") requireSafeUrl(value, baseUrl, node.loc);
-    } else if (node.type === "if") {
-      const result = lookup(node.path, data, node.loc);
-      if (typeof result.value !== "boolean") {
-        fail(`if variable ${node.path.join(".")} must be a boolean`, {
-          code: "VARIABLE_TYPE_ERROR",
-          file: node.loc?.file,
-          position: node.loc,
-        });
-      }
-      validateProgram(
-        result.value ? node.thenNodes : node.elseNodes,
-        data,
-        baseUrl,
-      );
-    } else if (node.type === "include") {
-      validateProgram(node.nodes, data, baseUrl);
+    try {
+      validateNode(node, scope, baseUrl, chain);
+    } catch (error) {
+      if (error instanceof TemplateError && !error.includeChain)
+        error.includeChain = [...chain];
+      throw error;
     }
+  }
+}
+
+function validateNode(node, scope, baseUrl, chain) {
+  if (node.type === "literal") return;
+  if (node.type === "output") {
+    const { value } = lookup(node.path, scope, node.loc);
+    if (typeof value !== "string") {
+      fail(`variable ${node.path.join(".")} must be a string`, {
+        code: "VARIABLE_TYPE_ERROR",
+        file: node.loc?.file,
+        position: node.loc,
+      });
+    }
+    if (node.kind === "url") requireSafeUrl(value, baseUrl, node.loc);
+    return;
+  }
+  if (node.type === "if") {
+    const { value } = lookup(node.path, scope, node.loc);
+    if (typeof value !== "boolean") {
+      fail(`if variable ${node.path.join(".")} must be a boolean`, {
+        code: "VARIABLE_TYPE_ERROR",
+        file: node.loc?.file,
+        position: node.loc,
+      });
+    }
+    validateProgram(
+      value ? node.thenNodes : node.elseNodes,
+      scope,
+      baseUrl,
+      chain,
+    );
+    return;
+  }
+  if (node.type === "each") {
+    const name = node.path.join(".");
+    const { value } = lookup(node.path, scope, node.loc);
+    if (!Array.isArray(value)) {
+      fail(`each variable ${name} must be an array`, {
+        code: "VARIABLE_TYPE_ERROR",
+        file: node.loc?.file,
+        position: node.loc,
+      });
+    }
+    if (value.length > MAX_EACH_ITEMS) {
+      fail(
+        `each variable ${name} has ${value.length} items; limit is ${MAX_EACH_ITEMS}`,
+        {
+          code: "EACH_LIMIT_EXCEEDED",
+          file: node.loc?.file,
+          position: node.loc,
+        },
+      );
+    }
+    for (let index = 0; index < value.length; index += 1) {
+      if (!isPlainObject(value[index])) {
+        fail(`each item ${name}[${index}] must be a plain object`, {
+          code: "VARIABLE_TYPE_ERROR",
+          file: node.loc?.file,
+          position: node.loc,
+        });
+      }
+    }
+    // Every item is validated before anything renders, so an invalid item
+    // fails the whole render instead of emitting earlier page fragments.
+    for (let index = 0; index < value.length; index += 1) {
+      try {
+        validateProgram(
+          node.nodes,
+          childScope(scope, node.alias, value[index]),
+          baseUrl,
+          chain,
+        );
+      } catch (error) {
+        if (error instanceof TemplateError) {
+          error.eachLocation = error.eachLocation
+            ? `${name}[${index}] > ${error.eachLocation}`
+            : `${name}[${index}]`;
+        }
+        throw error;
+      }
+    }
+    return;
+  }
+  if (node.type === "include") {
+    validateProgram(node.nodes, scope, baseUrl, [...chain, node.target]);
   }
 }
 
@@ -378,32 +512,35 @@ function escapeHtmlAttribute(value) {
   });
 }
 
-function renderProgram(nodes, data, baseUrl) {
+function renderProgram(nodes, scope, baseUrl) {
   let output = "";
   for (const node of nodes) {
     if (node.type === "literal") {
       output += node.value;
     } else if (node.type === "output") {
-      const { value } = lookup(node.path, data, node.loc);
+      const { value } = lookup(node.path, scope, node.loc);
       if (node.kind === "text") output += escapeHtmlText(value);
       else if (node.kind === "url")
         output += escapeHtmlAttribute(requireSafeUrl(value, baseUrl, node.loc));
       else output += escapeHtmlAttribute(value);
     } else if (node.type === "each") {
-      const { value } = lookup(node.path, data, node.loc);
-      for (const row of value) {
-        data[node.alias] = row;
-        output += renderProgram(node.nodes, data, baseUrl);
+      const { value } = lookup(node.path, scope, node.loc);
+      for (const item of value) {
+        output += renderProgram(
+          node.nodes,
+          childScope(scope, node.alias, item),
+          baseUrl,
+        );
       }
     } else if (node.type === "if") {
-      const { value } = lookup(node.path, data, node.loc);
+      const { value } = lookup(node.path, scope, node.loc);
       output += renderProgram(
         value ? node.thenNodes : node.elseNodes,
-        data,
+        scope,
         baseUrl,
       );
     } else if (node.type === "include") {
-      output += renderProgram(node.nodes, data, baseUrl);
+      output += renderProgram(node.nodes, scope, baseUrl);
     }
   }
   return output;

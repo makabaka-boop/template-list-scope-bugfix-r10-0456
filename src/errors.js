@@ -17,6 +17,7 @@ export class TemplateError extends Error {
       parts.push(`at ${this.file}:${describePosition(this.position)}`);
     if (this.includeChain?.length > 1)
       parts.push(`include chain: ${this.includeChain.join(" -> ")}`);
+    if (this.eachLocation) parts.push(`each item: ${this.eachLocation}`);
     return parts.join("\n  ");
   }
 }
