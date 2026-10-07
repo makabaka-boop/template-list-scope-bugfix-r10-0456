@@ -182,6 +182,10 @@ class HtmlScanner {
     this.state = merged;
   }
 
+  isData() {
+    return this.state.mode === MODE.DATA;
+  }
+
   assertComplete() {
     const s = this.state;
     if (s.mode !== MODE.DATA) {

@@ -108,11 +108,19 @@ export function parseTemplate(source, file) {
           position: loc,
         });
       }
+      if (frame.node.type === "each") {
+        fail("{{else}} is not supported inside {{#each}} blocks", {
+          code: "INVALID_TEMPLATE_SYNTAX",
+          file,
+          position: loc,
+        });
+      }
       frame.elseSeen = true;
     } else if (trimmed === "/if" || trimmed === "/each") {
+      const expected = trimmed.slice(1);
       const frame = stack.pop();
-      if (!frame || frame.node === root) {
-        fail("unmatched {{/if}}", {
+      if (!frame || frame.node === root || frame.node.type !== expected) {
+        fail(`unmatched {{${trimmed}}}`, {
           code: "INVALID_TEMPLATE_SYNTAX",
           file,
           position: loc,
@@ -169,7 +177,7 @@ export function parseTemplate(source, file) {
 
   if (stack.length > 1) {
     const open = stack[stack.length - 1].node;
-    fail("unterminated {{#if}} block", {
+    fail(`unterminated {{#${open.type}}} block`, {
       code: "INVALID_TEMPLATE_SYNTAX",
       file,
       position: open.loc,

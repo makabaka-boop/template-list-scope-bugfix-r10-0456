@@ -462,3 +462,233 @@ test("parse5 checks URL payloads do not introduce attributes or elements", () =>
   assert.equal(a.attrs[0].name, "href");
   assert.match(a.attrs[0].value, /^\/path\?x=%22/);
 });
+
+test("each: nested loops with repeated aliases shadow correctly and never mutate root data", () => {
+  const compiled = compile(
+    {
+      "index.html":
+        '{{#each sections as item}}<section><h2>{{item.title}}</h2><ul>{{#include "row.html"}}</ul><footer>{{item.title}}|{{shop}}</footer></section>{{/each}}',
+      "row.html":
+        '{{#each item.products as item}}<li><a href="{{item.link}}">{{item.name}}</a>{{#if item.sale}}<b>sale</b>{{/if}}</li>{{/each}}',
+    },
+    "index.html",
+  );
+  const data = {
+    shop: "RootShop",
+    sections: [
+      {
+        title: "Books",
+        products: [
+          { name: "A&B", link: "/p/a?x=1&y=2", sale: true },
+          { name: "<C>", link: "https://cdn.other/p/c", sale: false },
+        ],
+      },
+      {
+        title: "Toys",
+        products: [{ name: "D", link: "child/../d?q=1", sale: true }],
+      },
+    ],
+  };
+  const snapshot = JSON.stringify(data);
+  const html = compiled.render(data);
+  assert.equal(JSON.stringify(data), snapshot);
+  assert.equal(data.item, undefined);
+  // outer item.title is still visible after the inner loop finishes
+  assert.ok(html.includes("<footer>Books|RootShop</footer>"));
+  assert.ok(html.includes("<footer>Toys|RootShop</footer>"));
+  assert.ok(html.includes('<a href="/p/a?x=1&amp;y=2">A&amp;B</a>'));
+  assert.ok(html.includes('<a href="https://cdn.other/p/c">&lt;C&gt;</a>'));
+  assert.ok(html.includes('<a href="/app/d?q=1">D</a>'));
+  // reusable: a second render is identical and input stays untouched
+  assert.equal(compiled.render(data), html);
+  assert.equal(JSON.stringify(data), snapshot);
+});
+
+test("each: includes inside inner iterations read the innermost aliased item", () => {
+  const compiled = compile(
+    {
+      "index.html":
+        '{{#each groups as g}}<section>{{#each g.rows as g}}<span data-k="{{g.k}}">{{#include "p.html"}}</span>{{/each}}</section>{{/each}}',
+      "p.html": "{{g.v}}",
+    },
+    "index.html",
+  );
+  const html = compiled.render({
+    groups: [
+      { rows: [{ k: "1", v: "a" }, { k: "2", v: "b" }] },
+      { rows: [{ k: "3", v: "c" }] },
+    ],
+  });
+  assert.equal(
+    html,
+    '<section><span data-k="1">a</span><span data-k="2">b</span></section><section><span data-k="3">c</span></section>',
+  );
+});
+
+test("each: __proto__ aliases and keys never change root data or Object.prototype", () => {
+  const compiled = compile({
+    "index.html":
+      "{{#each __proto__ as constructor}}<p>{{constructor.name}}:{{constructor.__proto__}}</p>{{/each}}",
+  });
+  const weird = JSON.parse('{"__proto__":[{"name":"ok","__proto__":"safe"}]}');
+  const html = compiled.render(weird);
+  assert.equal(html, "<p>ok:safe</p>");
+  assert.equal(weird.constructor, Object);
+  assert.equal(Object.keys(weird).includes("polluted"), false);
+});
+
+test("each: empty arrays emit empty fragments and obey the same structural rules", () => {
+  const compiled = compile({
+    "index.html":
+      '<ul>{{#each rows as row}}<li title="{{row.t}}">{{row.t}}</li>{{/each}}</ul>',
+  });
+  assert.equal(compiled.render({ rows: [] }), "<ul></ul>");
+
+  rejectCode(
+    () =>
+      compile({
+        "index.html":
+          '{{#each rows as row}}<div title="x{{row.t}}{{/each}}after',
+      }),
+    "INCOMPATIBLE_EACH_CONTEXT",
+  );
+  rejectCode(
+    () =>
+      compile({
+        "index.html": "{{#each rows as row}}<!-- note {{/each}}x",
+      }),
+    "INCOMPATIBLE_EACH_CONTEXT",
+  );
+  rejectCode(
+    () =>
+      compile({
+        "index.html":
+          '<div class="{{#each rows as row}}{{row.t}}{{/each}}"></div>',
+      }),
+    "EACH_NOT_IN_TEXT_CONTEXT",
+  );
+  rejectCode(
+    () =>
+      compile({
+        "index.html": '{{#each rows as r}}<a href="x{{r.u}}"></a>{{/each}}',
+      }),
+    "PARTIAL_DYNAMIC_URL",
+  );
+  rejectCode(
+    () =>
+      compile({
+        "index.html": "{{#each rows as r}}<script>{{r.x}}</script>{{/each}}",
+      }),
+    "DYNAMIC_RAW_ELEMENT",
+  );
+});
+
+test("each: any invalid item fails the whole render atomically with include-chain diagnostics", () => {
+  const compiled = compile(
+    {
+      "index.html":
+        '<h1>{{title}}</h1>{{#each items as item}}{{#include "item.html"}}{{/each}}<p>tail</p>',
+      "item.html":
+        '<a href="{{item.url}}">{{item.name}}</a>{{#if item.hot}}<i>hot</i>{{/if}}',
+    },
+    "index.html",
+  );
+  const good = {
+    title: "Catalog",
+    items: [
+      { name: "good", url: "/g", hot: true },
+      { name: "second", url: "https://localhost/x", hot: false },
+    ],
+  };
+  assert.equal(
+    compiled.render(good),
+    '<h1>Catalog</h1><a href="/g">good</a><i>hot</i><a href="https://localhost/x">second</a><p>tail</p>',
+  );
+
+  const bad = {
+    title: "Catalog",
+    items: [
+      { name: "good", url: "/g", hot: true },
+      { name: "second", url: "https://localhost/x", hot: false },
+      { name: "evil", url: "javascript:alert(1)", hot: false },
+    ],
+  };
+  let caught;
+  assert.throws(
+    () => compiled.render(bad),
+    (error) => {
+      caught = error;
+      return error instanceof TemplateError;
+    },
+  );
+  assert.equal(caught.code, "INVALID_URL");
+  assert.equal(caught.file, "item.html");
+  assert.deepEqual(caught.includeChain, ["index.html", "item.html"]);
+  assert.equal(bad.items[2].url, "javascript:alert(1)");
+  assert.equal(bad.item, undefined);
+
+  rejectCode(
+    () =>
+      compiled.render({
+        title: "T",
+        items: [
+          { name: "a", url: "/a", hot: true },
+          { url: "/b", hot: true },
+        ],
+      }),
+    "MISSING_VARIABLE",
+  );
+  rejectCode(
+    () =>
+      compiled.render({
+        title: "T",
+        items: [{ name: "a", url: "/a", hot: "yes" }],
+      }),
+    "VARIABLE_TYPE_ERROR",
+  );
+  rejectCode(
+    () => compiled.render({ title: "T", items: ["nope"] }),
+    "VARIABLE_TYPE_ERROR",
+  );
+  rejectCode(
+    () => compiled.render({ title: "T", items: { 0: 1 } }),
+    "VARIABLE_TYPE_ERROR",
+  );
+  rejectCode(
+    () =>
+      compiled.render({
+        title: "T",
+        items: Array.from({ length: 33 }, (_, i) => ({
+          name: `n${i}`,
+          url: `/n${i}`,
+          hot: false,
+        })),
+      }),
+    "EACH_LIMIT_EXCEEDED",
+  );
+});
+
+test("each: parser rejects mismatched closers and else inside loops", () => {
+  rejectCode(
+    () =>
+      compile({
+        "index.html": "{{#each rows as r}}x{{/if}}",
+      }),
+    "INVALID_TEMPLATE_SYNTAX",
+  );
+  rejectCode(
+    () =>
+      compile({
+        "index.html":
+          "{{#each rows as r}}{{#if x}}a{{/each}}{{/if}}",
+      }),
+    "INVALID_TEMPLATE_SYNTAX",
+  );
+  rejectCode(
+    () =>
+      compile({
+        "index.html": "{{#each rows as r}}a{{else}}b{{/each}}",
+      }),
+    "INVALID_TEMPLATE_SYNTAX",
+  );
+});
